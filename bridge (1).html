@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>FFB1|boot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<style>
+  body { margin: 0; padding: 40px 24px; background: #15120e; color: #e9dcc0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 12px; color: #d9b26a; }
+  code { background: #2a241b; padding: 1px 6px; border-radius: 4px; }
+  p { margin: 0 0 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Familiar Faces — страница онлайн-обновления</h1>
+  <p>Это служебная страница мода «Уже играли» для Deadlock. Её открывает встроенный браузер игры,
+     чтобы мод мог узнать о матчах, сыгранных уже после сборки VPK, о том, кто из игроков матча дружит в Steam
+     (так видно, кто играет в пати), и о том, сколько каждый игрок играл на своём герое.</p>
+  <p>Страница ничего не хранит на сервере и никуда не отправляет данные, кроме запросов к открытому
+     API <code>api.deadlock-api.com</code>. Руками здесь делать нечего.</p>
+  <p id="state">Состояние: ожидание запросов от игры.</p>
+</main>
+<script>
+/*
+  Мост Familiar Faces. Работает ВНУТРИ встроенного браузера Deadlock (панель CitadelHTMLPanel).
+  С обновления игры 01.10.2026 она открывает только HTTPS-страницы, поэтому файл должен лежать на HTTPS-хостинге
+  (например, GitHub Pages).
+
+    мод -> страница :  bridge.html#<encodeURIComponent(JSON {s: сессия, q: номер, f: функция, a: аргументы})>
+    страница -> мод :  document.title = "FFB1|q|ok|часть|всего|seq|данные"     (данные — ASCII JSON, до 3000 символов на часть)
+
+  Встроенный Chromium старый: только ES5/ES2015, без ?. и ??.
+*/
+(function () {
+  "use strict";
+  var API = "https://api.deadlock-api.com";
+  var MODES = ["normal", "street_brawl"];
+  var STATS_TTL_MS = 120000;
+  var MAX_DELTA = 3000;
+
+  // ---------------------------------------------------------- ответ через заголовок страницы
+  var outQ = [], sending = false, seq = 0;
+  function pump() {
+    if (sending) return;
+    var m = outQ.shift();
+    if (m === undefined) return;
+    sending = true;
+    document.title = m;
+    setTimeout(function () { sending = false; pump(); }, 300);
+  }
+  function ascii(json) {
+    return json.replace(/[\u007f-\uffff]/g, function (c) { return "\\u" + ("0000" + c.charCodeAt(0).toString(16)).slice(-4); });
+  }
+  function respond(q, ok, value) {
+    var text = ascii(JSON.stringify(value === undefined ? null : value));
+    var CH = 3000, total = Math.max(1, Math.ceil(text.length / CH));
+    for (var i = 0; i < total; i++) {
+      outQ.push("FFB1|" + q + "|" + (ok ? 1 : 0) + "|" + i + "|" + total + "|" + (++seq) + "|" + text.substr(i * CH, CH));
+    }
+    pump();
+  }
+
+  // ---------------------------------------------------------- сеть
+  function get(path) {
+    return fetch(API + path).then(function (r) {
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error("HTTP " + r.status + " " + path.split("?")[0]);
+      return r.json();
+    });
+  }
+
+  // Те же правила сравнения ников, что в скрипте мода (canon / keyOf).
+  var INVISIBLE = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]/g;
+  function clean(s) {
+    return String(s == null ? "" : s).replace(/\s+/g, " ").replace(INVISIBLE, "").replace(/ +/g, " ").replace(/^ +| +$/g, "");
+  }
+  function keyOf(s) { return clean(s).toLowerCase(); }
+
+  // ---------------------------------------------------------- свежая статистика «с кем играл»
+  var S = { acc: 0, at: 0, byId: null, loading: null, loadingAcc: 0 };
+  function loadStats(acc) {
+    if (S.byId && S.acc === acc && Date.now() - S.at < STATS_TTL_MS) return Promise.resolve(S.byId);
+    if (S.loading && S.loadingAcc === acc) return S.loading;
+    var reqs = [];
+    MODES.forEach(function (mode) {
+      reqs.push(get("/v1/players/" + acc + "/mate-stats?game_mode=" + mode));
+      reqs.push(get("/v1/players/" + acc + "/enemy-stats?game_mode=" + mode));
+    });
+    S.loadingAcc = acc;
+    S.loading = Promise.all(reqs).then(function (res) {
+      var byId = {};                       // id -> [игр вместе, побед вместе, игр против, моих побед против, последний матч]
+      for (var r = 0; r < res.length; r++) {
+        var list = res[r] || [], enemy = r % 2 === 1;
+        for (var i = 0; i < list.length; i++) {
+          var x = list[i], id = enemy ? x.enemy_id : x.mate_id;
+          if (id === acc) continue;
+          var row = byId[id] || (byId[id] = [0, 0, 0, 0, 0]);
+          row[enemy ? 2 : 0] += x.matches_played;
+          row[enemy ? 3 : 1] += x.wins;
+          var ms = x.matches || [];
+          for (var k = 0; k < ms.length; k++) if (ms[k] > row[4]) row[4] = ms[k];
+        }
+      }
+      S.byId = byId; S.acc = acc; S.at = Date.now(); S.loading = null;
+      return byId;
+    }, function (e) { S.loading = null; throw e; });
+    return S.loading;
+  }
+
+  // ---------------------------------------------------------- ники игроков из матчей после сборки VPK
+  var names = {};                          // id -> ник
+  var LS_KEY = "ffb1_names";
+  try { names = JSON.parse(localStorage.getItem(LS_KEY) || "{}") || {}; } catch (e) { names = {}; }
+  function saveNames() { try { localStorage.setItem(LS_KEY, JSON.stringify(names)); } catch (e) {} }
+
+  function loadNames(ids) {
+    var missing = [];
+    for (var i = 0; i < ids.length; i++) if (names[ids[i]] === undefined) missing.push(ids[i]);
+    if (!missing.length) return Promise.resolve();
+    var chain = Promise.resolve();
+    for (var j = 0; j < missing.length; j += 200) {
+      (function (chunk) {
+        chain = chain.then(function () { return get("/v1/players/steam?account_ids=" + chunk.join(",")); })
+          .then(function (list) {
+            var got = {};
+            (list || []).forEach(function (p) { names[p.account_id] = p.personaname || ""; got[p.account_id] = true; });
+            chunk.forEach(function (id) { if (!got[id]) names[id] = ""; });   // профиля нет — не спрашивать снова
+          });
+      })(missing.slice(j, j + 200));
+    }
+    return chain.then(saveNames);
+  }
+
+  // resolve(acc, since, [ники], [id из вшитой таблицы]) ->
+  //   { t: время данных, n: игроков из матчей после сборки,
+  //     h: [[номер ника, id, вместе, побед, против, побед, точное совпадение регистра]],
+  //     f: [[id, вместе, побед, против, побед]] }
+  function resolve(acc, since, askNames, askIds) {
+    acc = Number(acc) || 0;
+    since = Number(since) || 0;
+    askNames = askNames || [];
+    askIds = askIds || [];
+    if (!acc) return Promise.reject(new Error("no account id"));
+    return loadStats(acc).then(function (byId) {
+      var delta = [];
+      for (var id in byId) if (byId[id][4] > since) delta.push(Number(id));
+      delta.sort(function (a, b) { return byId[b][4] - byId[a][4]; });
+      if (delta.length > MAX_DELTA) delta.length = MAX_DELTA;
+      return loadNames(delta).then(function () {
+        var index = {};
+        delta.forEach(function (pid) {
+          var k = keyOf(names[pid]);
+          if (!k) return;
+          (index[k] || (index[k] = [])).push(pid);
+        });
+        var h = [], f = [];
+        askNames.forEach(function (name, i) {
+          var list = index[keyOf(name)] || [];
+          list.forEach(function (pid) {
+            var r = byId[pid];
+            h.push([i, pid, r[0], r[1], r[2], r[3], clean(names[pid]) === clean(name) ? 1 : 0]);
+          });
+        });
+        askIds.forEach(function (pid) {
+          var r = byId[pid];
+          if (r) f.push([Number(pid), r[0], r[1], r[2], r[3]]);
+        });
+        return { t: Math.floor(S.at / 1000), n: delta.length, h: h, f: f };
+      });
+    });
+  }
+
+  // ---------------------------------------------------------- кто с кем дружит в Steam (для поиска пати)
+  // friends([id игроков матча], refresh) ->
+  //   { p: [[a, b], ...]  пары друзей среди этих игроков (a < b),
+  //     h: [id]           у кого список друзей пуст или скрыт,
+  //     m: [id]           чьих профилей в базе API нет,
+  //     n: [[id, ник]] }
+  // refresh = 1: профили, которых в базе нет, один раз запросить у Steam (у API на это жёсткий лимит).
+  function friends(ids, refresh) {
+    var want = {}, list = [];
+    (ids || []).forEach(function (x) {
+      x = Number(x);
+      if (x > 0 && x <= 4294967295 && Math.floor(x) === x && !want[x] && list.length < 24) { want[x] = true; list.push(x); }
+    });
+    list.sort(function (a, b) { return a - b; });
+    if (list.length < 2) return Promise.resolve({ p: [], h: [], m: [], n: [] });
+    var got = {};
+    function take(profiles) { (profiles || []).forEach(function (pr) { if (pr && want[pr.account_id]) got[pr.account_id] = pr; }); }
+    return get("/v1/players/steam?account_ids=" + list.join(",")).then(function (profiles) {
+      take(profiles);
+      var missing = list.filter(function (x) { return !got[x]; });
+      if (!missing.length || !refresh) return null;
+      return get("/v1/players/steam?refresh=true&account_ids=" + missing.join(",")).then(take, function () { return null; });
+    }).then(function () {
+      var seenPair = {}, p = [], h = [], m = [], n = [];
+      list.forEach(function (a) {
+        var pr = got[a];
+        if (!pr) { m.push(a); return; }
+        n.push([a, String(pr.personaname || "")]);
+        var fr = pr.friends || [];
+        if (!fr.length) h.push(a);
+        fr.forEach(function (f) {
+          var b = f && f.account_id;
+          if (!want[b] || b === a) return;
+          var lo = Math.min(a, b), hi = Math.max(a, b), key = lo + "-" + hi;
+          if (!seenPair[key]) { seenPair[key] = true; p.push([lo, hi]); }
+        });
+      });
+      p.sort(function (x, y) { return x[0] - y[0] || x[1] - y[1]; });
+      return { p: p, h: h, m: m, n: n };
+    });
+  }
+
+  // ---------------------------------------------------------- опыт игроков на героях и их прошлая игра
+  // scout([[id, герой], ...]) ->
+  //   { p: [[id, герой, матчей в истории, игр на герое, побед на нём, последних игр, из них на герое,
+  //          самый частый герой, игр на нём, прошлая игра: герой, убийств, смертей, помощи, победа (1/0), время начала], ...],
+  //     e: [id] — чью историю получить не вышло }
+  // Считаются только матчи обычного режима (game_mode = 1) из истории, которую хранит deadlock-api.
+  var HIST_TTL_MS = 600000, RECENT = 20, SCOUT_MAX = 16;
+  var hist = {};                           // id -> { at, s: сводка }
+  function summarize(list) {
+    var ms = [], i, m;
+    for (i = 0; i < list.length; i++) {
+      m = list[i];
+      if (m && m.game_mode === 1 && m.hero_id > 0 && m.start_time > 0) ms.push(m);
+    }
+    ms.sort(function (a, b) { return b.start_time - a.start_time || b.match_id - a.match_id; });
+    var by = {}, recent = [], top = 0;
+    for (i = 0; i < ms.length; i++) {
+      var h = ms[i].hero_id, r = by[h] || (by[h] = [0, 0]);
+      r[0]++;
+      if (ms[i].match_result === ms[i].player_team) r[1]++;
+      if (i < RECENT) recent.push(h);
+    }
+    for (var k in by) {
+      var id = Number(k);
+      if (!top || by[id][0] > by[top][0] || (by[id][0] === by[top][0] && id < top)) top = id;
+    }
+    var L = ms[0];
+    return { n: ms.length, by: by, recent: recent, top: top,
+      last: L ? [L.hero_id, Number(L.player_kills) || 0, Number(L.player_deaths) || 0, Number(L.player_assists) || 0,
+        L.match_result === L.player_team ? 1 : 0, L.start_time] : [0, 0, 0, 0, 0, 0] };
+  }
+  function loadHistory(acc) {
+    var c = hist[acc];
+    if (c && Date.now() - c.at < HIST_TTL_MS) return Promise.resolve(c.s);
+    return get("/v1/players/" + acc + "/match-history?only_stored_history=true").then(function (list) {
+      var s = summarize(Array.isArray(list) ? list : []);
+      hist[acc] = { at: Date.now(), s: s };
+      return s;
+    });
+  }
+  function scout(pairs) {
+    var list = [], seen = {};
+    (pairs || []).forEach(function (p) {
+      var a = Number(p && p[0]), h = Number(p && p[1]) || 0;
+      if (a > 0 && a <= 4294967295 && Math.floor(a) === a && !seen[a] && list.length < SCOUT_MAX) { seen[a] = true; list.push([a, h]); }
+    });
+    var out = [], bad = [];
+    return Promise.all(list.map(function (p) {
+      return loadHistory(p[0]).then(function (s) {
+        var hr = s.by[p[1]] || [0, 0], rH = 0;
+        for (var i = 0; i < s.recent.length; i++) if (s.recent[i] === p[1]) rH++;
+        out.push([p[0], p[1], s.n, hr[0], hr[1], s.recent.length, rH, s.top, s.top ? s.by[s.top][0] : 0].concat(s.last));
+      }, function () { bad.push(p[0]); });
+    })).then(function () {
+      out.sort(function (x, y) { return x[0] - y[0]; });
+      bad.sort(function (x, y) { return x - y; });
+      return { p: out, e: bad };
+    });
+  }
+
+  var fn = {
+    ping: function () {
+      var ls = 0;
+      try { localStorage.setItem("ffb1_test", "1"); ls = localStorage.getItem("ffb1_test") === "1" ? 1 : 0; } catch (e) {}
+      return { v: 3, ls: ls, fetch: typeof fetch === "function" ? 1 : 0 };     // v: 2 — страница умеет friends, v: 3 — и scout
+    },
+    resolve: resolve,
+    friends: friends,
+    scout: scout
+  };
+
+  // ---------------------------------------------------------- приём запросов
+  var seen = {};
+  function handle() {
+    var req;
+    try { req = JSON.parse(decodeURIComponent(location.hash.slice(1))); } catch (e) { return; }
+    if (!req || typeof req.f !== "string" || !Object.prototype.hasOwnProperty.call(fn, req.f)) return;
+    var key = req.s + ":" + req.q;
+    if (seen[key]) return;
+    seen[key] = true;
+    var st = document.getElementById("state");
+    if (st) st.textContent = "Состояние: запрос " + req.f + " #" + req.q;
+    Promise.resolve().then(function () { return fn[req.f].apply(null, req.a || []); }).then(
+      function (res) { respond(req.q, true, res); },
+      function (e) { respond(req.q, false, String((e && e.message) || e)); });
+  }
+  window.addEventListener("hashchange", handle);
+  handle();
+})();
+</script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/vce701823e78c4301a35b7e07294d87301792088814092" integrity="sha512-UKNk8GbxkABxKcXYuLkO16EleLGUkcvJWtpSNmExE0Too3ZaFAxTscNWEc1OdAv5/BikHawapSCaiD2XCmp+Bw==" data-cf-beacon='{"version":"2024.11.0","token":"1954b47c125f43f8b4338b3c4f804e4f","spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>
