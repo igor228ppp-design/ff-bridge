@@ -17,10 +17,12 @@
 <main>
   <h1>Familiar Faces — страница онлайн-обновления</h1>
   <p>Это служебная страница мода «Уже играли» для Deadlock. Её открывает встроенный браузер игры,
-     чтобы мод мог узнать о матчах, сыгранных уже после сборки VPK, и о том, кто из игроков матча дружит в Steam
-     (так видно, кто играет в пати).</p>
+     чтобы мод мог узнать о матчах, сыгранных уже после сборки VPK, о том, кто из игроков матча дружит в Steam
+     (так видно, кто играет в пати), и о том, сколько каждый игрок играл на своём герое.
+     Здесь же хранятся метки, которые ты ставишь игрокам: у самого мода в игре памяти нет.</p>
   <p>Страница ничего не хранит на сервере и никуда не отправляет данные, кроме запросов к открытому
-     API <code>api.deadlock-api.com</code>. Руками здесь делать нечего.</p>
+     API <code>api.deadlock-api.com</code>. Метки лежат в хранилище браузера (localStorage) на твоём компьютере
+     и никуда не передаются. Руками здесь делать нечего.</p>
   <p id="state">Состояние: ожидание запросов от игры.</p>
 </main>
 <script>
@@ -215,14 +217,148 @@
     });
   }
 
+  // ---------------------------------------------------------- опыт игроков на героях и их прошлая игра
+  // scout([[id, герой], ...]) ->
+  //   { p: [[id, герой, матчей в истории, игр на герое, побед на нём, последних игр, из них на герое,
+  //          самый частый герой, игр на нём, прошлая игра: герой, убийств, смертей, помощи, победа (1/0), время начала], ...],
+  //     e: [id] — чью историю получить не вышло }
+  // Считаются только матчи обычного режима (game_mode = 1) из истории, которую хранит deadlock-api.
+  var HIST_TTL_MS = 600000, RECENT = 20, SCOUT_MAX = 16;
+  var hist = {};                           // id -> { at, s: сводка }
+  function summarize(list) {
+    var ms = [], i, m;
+    for (i = 0; i < list.length; i++) {
+      m = list[i];
+      if (m && m.game_mode === 1 && m.hero_id > 0 && m.start_time > 0) ms.push(m);
+    }
+    ms.sort(function (a, b) { return b.start_time - a.start_time || b.match_id - a.match_id; });
+    var by = {}, recent = [], top = 0;
+    for (i = 0; i < ms.length; i++) {
+      var h = ms[i].hero_id, r = by[h] || (by[h] = [0, 0]);
+      r[0]++;
+      if (ms[i].match_result === ms[i].player_team) r[1]++;
+      if (i < RECENT) recent.push(h);
+    }
+    for (var k in by) {
+      var id = Number(k);
+      if (!top || by[id][0] > by[top][0] || (by[id][0] === by[top][0] && id < top)) top = id;
+    }
+    var L = ms[0];
+    return { n: ms.length, by: by, recent: recent, top: top,
+      last: L ? [L.hero_id, Number(L.player_kills) || 0, Number(L.player_deaths) || 0, Number(L.player_assists) || 0,
+        L.match_result === L.player_team ? 1 : 0, L.start_time] : [0, 0, 0, 0, 0, 0] };
+  }
+  function loadHistory(acc) {
+    var c = hist[acc];
+    if (c && Date.now() - c.at < HIST_TTL_MS) return Promise.resolve(c.s);
+    return get("/v1/players/" + acc + "/match-history?only_stored_history=true").then(function (list) {
+      var s = summarize(Array.isArray(list) ? list : []);
+      hist[acc] = { at: Date.now(), s: s };
+      return s;
+    });
+  }
+  function scout(pairs) {
+    var list = [], seen = {};
+    (pairs || []).forEach(function (p) {
+      var a = Number(p && p[0]), h = Number(p && p[1]) || 0;
+      if (a > 0 && a <= 4294967295 && Math.floor(a) === a && !seen[a] && list.length < SCOUT_MAX) { seen[a] = true; list.push([a, h]); }
+    });
+    var out = [], bad = [];
+    return Promise.all(list.map(function (p) {
+      return loadHistory(p[0]).then(function (s) {
+        var hr = s.by[p[1]] || [0, 0], rH = 0;
+        for (var i = 0; i < s.recent.length; i++) if (s.recent[i] === p[1]) rH++;
+        out.push([p[0], p[1], s.n, hr[0], hr[1], s.recent.length, rH, s.top, s.top ? s.by[s.top][0] : 0].concat(s.last));
+      }, function () { bad.push(p[0]); });
+    })).then(function () {
+      out.sort(function (x, y) { return x[0] - y[0]; });
+      bad.sort(function (x, y) { return x - y; });
+      return { p: out, e: bad };
+    });
+  }
+
+  // ---------------------------------------------------------- метки об игроках
+  // У интерфейса Deadlock нет своего хранилища, а у встроенного браузера есть: localStorage страницы лежит на диске
+  // (в профиле браузера Steam) и переживает перезапуск игры. Поэтому метки хранит эта страница.
+  //   запись: account_id -> [[метки], время изменения (unix, с), ник в тот момент]
+  //   noteSet(id, [метки], время, ник) -> { ok, n: всего игроков с метками, ls }   (пустой список меток — снять)
+  //   notes([id], [ники])              -> { n, ls, p: [[id, [метки], время, ник], ...] }
+  //                                       — метки этих аккаунтов и тех, кого пометили под одним из этих ников
+  // Побеждает запись с более поздним временем, поэтому повтор старого запроса ничего не портит.
+  var NOTES_KEY = "ffb1_notes";
+  var NOTE_TAGS_MAX = 8, NOTE_TAG_LEN = 24, NOTE_NICK_LEN = 64;
+  var notesMem = null, notesStored = false;
+  function loadNotes() {
+    if (notesMem) return notesMem;
+    notesMem = {};
+    try {
+      var raw = JSON.parse(localStorage.getItem(NOTES_KEY) || "{}");
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        for (var k in raw) {
+          var e = cleanNote(k, raw[k]);
+          if (e && e[1].length) notesMem[e[0]] = [e[1], e[2], e[3]];
+        }
+      }
+      notesStored = true;
+    } catch (e2) { notesStored = false; }
+    return notesMem;
+  }
+  // -> [id, [метки], время, ник] или null, если запись негодная
+  function cleanNote(acc, v) {
+    acc = Number(acc);
+    if (!(acc > 0 && acc <= 4294967295 && Math.floor(acc) === acc) || !Array.isArray(v)) return null;
+    var t = Number(v[1]);
+    if (!(t > 0 && t < 1e11 && Math.floor(t) === t) || !Array.isArray(v[0])) return null;
+    var tags = [], seenTag = {};
+    v[0].forEach(function (x) {
+      if (typeof x !== "string") return;
+      x = clean(x).slice(0, NOTE_TAG_LEN);
+      var key = x.toLowerCase();
+      if (x && !seenTag[key] && tags.length < NOTE_TAGS_MAX) { seenTag[key] = true; tags.push(x); }
+    });
+    return [acc, tags, t, typeof v[2] === "string" ? v[2].slice(0, NOTE_NICK_LEN) : ""];
+  }
+  function countNotes(all) { var n = 0; for (var k in all) n++; return n; }
+  function noteSet(acc, tags, t, nick) {
+    var e = cleanNote(acc, [tags, t, nick]);
+    if (!e) return Promise.reject(new Error("bad note"));
+    var all = loadNotes(), cur = all[e[0]];
+    if (!cur || e[2] >= cur[1]) {
+      if (e[1].length) all[e[0]] = [e[1], e[2], e[3]]; else delete all[e[0]];
+      try { localStorage.setItem(NOTES_KEY, JSON.stringify(all)); notesStored = true; } catch (e2) { notesStored = false; }
+    }
+    return Promise.resolve({ ok: notesStored ? 1 : 0, n: countNotes(all), ls: notesStored ? 1 : 0 });
+  }
+  function notes(accs, nicks) {
+    var all = loadNotes(), out = [], taken = {}, want = {}, any = false;
+    (accs || []).forEach(function (a) {
+      a = Number(a);
+      var e = all[a];
+      if (e && !taken[a]) { taken[a] = true; out.push([a, e[0], e[1], e[2]]); }
+    });
+    (nicks || []).forEach(function (n) { var k = keyOf(n); if (k) { want[k] = true; any = true; } });
+    if (any) {
+      for (var id in all) {
+        if (taken[id]) continue;
+        if (want[keyOf(all[id][2])]) { taken[id] = true; out.push([Number(id), all[id][0], all[id][1], all[id][2]]); }
+      }
+    }
+    out.sort(function (x, y) { return x[0] - y[0]; });
+    return Promise.resolve({ n: countNotes(all), ls: notesStored ? 1 : 0, p: out });
+  }
+
   var fn = {
     ping: function () {
       var ls = 0;
       try { localStorage.setItem("ffb1_test", "1"); ls = localStorage.getItem("ffb1_test") === "1" ? 1 : 0; } catch (e) {}
-      return { v: 2, ls: ls, fetch: typeof fetch === "function" ? 1 : 0 };     // v: 2 — страница умеет friends
+      // v: 2 — страница умеет friends, v: 3 — и scout, v: 4 — и метки (notes, noteSet)
+      return { v: 4, ls: ls, fetch: typeof fetch === "function" ? 1 : 0 };
     },
     resolve: resolve,
-    friends: friends
+    friends: friends,
+    scout: scout,
+    notes: notes,
+    noteSet: noteSet
   };
 
   // ---------------------------------------------------------- приём запросов
